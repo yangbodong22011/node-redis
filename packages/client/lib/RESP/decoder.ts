@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/ban-ts-comment, @typescript-eslint/no-explicit-any */
 // @ts-nocheck -- decoder uses untyped continuation callbacks; full typing tracked separately
 import { VerbatimString } from './verbatim-string';
-import { SimpleError, BlobError, ErrorReply } from '../errors';
+import { SimpleError, BlobError, ErrorReply, RedirectError } from '../errors';
 import { TypeMapping } from './types';
 
 // https://github.com/redis/redis-specifications/blob/master/protocol/RESP3.md
@@ -648,28 +648,36 @@ export class Decoder {
     const string = this.#decodeSimpleString(String, chunk);
     return typeof string === 'function' ?
       this.#continueDecodeSimpleError.bind(this, string) :
-      new SimpleError(string);
+      Decoder.#createError(string, SimpleError);
   }
 
   #continueDecodeSimpleError(stringCb, chunk) {
     const string = stringCb(chunk);
     return typeof string === 'function' ?
       this.#continueDecodeSimpleError.bind(this, string) :
-      new SimpleError(string);
+      Decoder.#createError(string, SimpleError);
   }
 
   #decodeBlobError(chunk) {
     const string = this.#decodeBlobString(String, chunk);
     return typeof string === 'function' ?
       this.#continueDecodeBlobError.bind(this, string) :
-      new BlobError(string);
+      Decoder.#createError(string, BlobError);
   }
 
   #continueDecodeBlobError(stringCb, chunk) {
     const string = stringCb(chunk);
     return typeof string === 'function' ?
       this.#continueDecodeBlobError.bind(this, string) :
-      new BlobError(string);
+      Decoder.#createError(string, BlobError);
+  }
+
+  static #createError<T extends ErrorReply>(message: string, fallback: new (message: string) => T): ErrorReply {
+    if (message.startsWith('REDIRECT ')) {
+      return new RedirectError(message);
+    }
+
+    return new fallback(message);
   }
 
   #decodeNestedType(typeMapping, chunk) {

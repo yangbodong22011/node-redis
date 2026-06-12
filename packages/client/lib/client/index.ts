@@ -4,7 +4,7 @@ import { BasicAuth, CredentialsError, CredentialsProvider, StreamingCredentialsP
 import RedisCommandsQueue, { CommandOptions } from './commands-queue';
 import { EventEmitter } from 'node:events';
 import { attachConfig, functionArgumentsPrefix, getTransformReply, scriptArgumentsPrefix } from '../commander';
-import { ClientClosedError, ClientOfflineError, DisconnectsClientError, WatchError } from '../errors';
+import { ClientClosedError, ClientOfflineError, DisconnectsClientError, RedirectError, WatchError } from '../errors';
 import { URL } from 'node:url';
 import { TcpSocketConnectOpts } from 'node:net';
 import { PUBSUB_TYPE, PubSubType, PubSubListener, PubSubTypeListeners, ChannelListeners } from './pub-sub';
@@ -195,6 +195,12 @@ export interface RedisClientOptions<
    * The default is 10000
    */
   maintRelaxedSocketTimeout?: number;
+  /**
+   * Enables CAPA redirect support. When enabled, the client sends
+   * `CLIENT CAPA redirect` on connect and retries a command once against the
+   * primary returned by `-REDIRECT host:port`.
+   */
+  capaRedirect?: boolean;
 };
 
 /**
@@ -763,8 +769,28 @@ export default class RedisClient<
       this.#options.RESP ?? DEFAULT_RESP,
       this.#options.commandsQueueMaxLength,
       (channel, listeners) => this.emit('sharded-channel-moved', channel, listeners),
-      clientId
+      clientId,
+      this.#options.capaRedirect ? (err, command) => this.#handleCapaRedirect(err, command) : undefined
     );
+  }
+
+  #handleCapaRedirect(err: RedirectError, _command: unknown): boolean {
+    const socketOptions = this.#options.socket;
+    if (socketOptions && 'path' in socketOptions) {
+      return false;
+    }
+
+    this.#options.socket = {
+      ...socketOptions,
+      host: err.host,
+      port: err.port
+    } as RedisClientOptions<M, F, S, RESP, TYPE_MAPPING>['socket'];
+
+    this.#socket.reconnectTo(err.host, err.port)
+      .then(() => this.#write())
+      .catch(error => this.emit('error', error));
+
+    return true;
   }
 
   /**
@@ -897,6 +923,10 @@ export default class RedisClient<
 
     if (this.#options.readonly) {
       commands.push({ cmd: parseArgs(COMMANDS.READONLY) });
+    }
+
+    if (this.#options.capaRedirect) {
+      commands.push({ cmd: ['CLIENT', 'CAPA', 'redirect'] });
     }
 
     if (!this.#options.disableClientInfo) {

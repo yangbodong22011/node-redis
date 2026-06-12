@@ -3,7 +3,7 @@ import encodeCommand from '../RESP/encoder';
 import { Decoder, PUSH_TYPE_MAPPING, RESP_TYPES } from '../RESP/decoder';
 import { TypeMapping, ReplyUnion, RespVersions, RedisArgument } from '../RESP/types';
 import { ChannelListeners, PubSub, PubSubCommand, PubSubListener, PubSubType, PubSubTypeListeners } from './pub-sub';
-import { AbortError, ErrorReply, CommandTimeoutDuringMaintenanceError, TimeoutError } from '../errors';
+import { AbortError, ErrorReply, CommandTimeoutDuringMaintenanceError, RedirectError, TimeoutError } from '../errors';
 import { MonitorCallback } from '.';
 import { dbgMaintenance } from './enterprise-maintenance-manager';
 
@@ -28,6 +28,7 @@ export interface CommandOptions<T = TypeMapping> {
 
 export interface CommandToWrite extends CommandWaitingForReply {
   args: ReadonlyArray<RedisArgument> | undefined;
+  originalArgs: ReadonlyArray<RedisArgument> | undefined;
   chainId: symbol | undefined;
   abort: {
     signal: AbortSignal;
@@ -46,9 +47,11 @@ interface CommandWaitingForReply {
   reject(err: unknown): void;
   channelsCounter: number | undefined;
   typeMapping: TypeMapping | undefined;
+  redirectRetryCount?: number;
 }
 
 export type OnShardedChannelMoved = (channel: string, listeners: ChannelListeners) => void;
+export type OnRedirect = (err: RedirectError, command: CommandToWrite) => boolean;
 
 const PONG = Buffer.from('pong'),
   RESET = Buffer.from('RESET');
@@ -71,12 +74,13 @@ export default class RedisCommandsQueue {
   readonly #maxLength;
   readonly #toWrite = new DoublyLinkedList<CommandToWrite>();
   readonly #waitingForReply =
-    new EmptyAwareSinglyLinkedList<CommandWaitingForReply>();
+    new EmptyAwareSinglyLinkedList<CommandToWrite>();
   readonly #onShardedChannelMoved;
   #chainInExecution: symbol | undefined;
   readonly decoder;
   readonly #pubSub;
   readonly #clientId: string;
+  readonly #onRedirect;
 
   #pushHandlers: PushHandler[] = [this.#onPush.bind(this)];
 
@@ -146,11 +150,13 @@ export default class RedisCommandsQueue {
     respVersion: RespVersions,
     maxLength: number | null | undefined,
     onShardedChannelMoved: OnShardedChannelMoved,
-    clientId: string
+    clientId: string,
+    onRedirect?: OnRedirect
   ) {
     this.#respVersion = respVersion;
     this.#maxLength = maxLength;
     this.#onShardedChannelMoved = onShardedChannelMoved;
+    this.#onRedirect = onRedirect;
     this.decoder = this.#initiateDecoder();
     this.#clientId = clientId;
     this.#pubSub = new PubSub(this.#clientId);
@@ -161,7 +167,20 @@ export default class RedisCommandsQueue {
   }
 
   #onErrorReply(err: ErrorReply) {
-    this.#waitingForReply.shift()!.reject(err);
+    const command = this.#waitingForReply.shift()!;
+    if (
+      err instanceof RedirectError &&
+      command.originalArgs &&
+      (command.redirectRetryCount ?? 0) === 0 &&
+      this.#onRedirect?.(err, command)
+    ) {
+      command.args = command.originalArgs;
+      command.redirectRetryCount = 1;
+      this.#toWrite.unshift(command);
+      return;
+    }
+
+    command.reject(err);
   }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- heterogeneous push payload
@@ -271,6 +290,7 @@ export default class RedisCommandsQueue {
       let node: DoublyLinkedNode<CommandToWrite>;
       const value: CommandToWrite = {
         args,
+        originalArgs: args,
         chainId: options?.chainId,
         abort: undefined,
         timeout: undefined,
@@ -325,6 +345,7 @@ export default class RedisCommandsQueue {
       this.#toWrite.add(
         {
           args: command.args,
+          originalArgs: command.args,
           chainId,
           abort: undefined,
           timeout: undefined,
@@ -478,6 +499,7 @@ export default class RedisCommandsQueue {
       this.#toWrite.add(
         {
           args: ["MONITOR"],
+          originalArgs: ["MONITOR"],
           chainId: options?.chainId,
           abort: undefined,
           timeout: undefined,
@@ -534,6 +556,7 @@ export default class RedisCommandsQueue {
 
       this.#toWrite.push({
         args: ["RESET"],
+        originalArgs: ["RESET"],
         chainId,
         abort: undefined,
         timeout: undefined,

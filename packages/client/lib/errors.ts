@@ -75,6 +75,26 @@ export class SimpleError extends ErrorReply {}
 
 export class BlobError extends ErrorReply {}
 
+export class RedirectError extends ErrorReply {
+  readonly host: string;
+  readonly port: number;
+
+  constructor(message: string) {
+    super(message);
+    const address = message.substring('REDIRECT '.length),
+      separator = address.lastIndexOf(':');
+    if (separator === -1) {
+      throw new ErrorReply(message);
+    }
+
+    this.host = address.substring(0, separator);
+    this.port = Number(address.substring(separator + 1));
+    if (!this.host || !Number.isInteger(this.port)) {
+      throw new ErrorReply(message);
+    }
+  }
+}
+
 export class TimeoutError extends Error {}
 
 export class SocketTimeoutDuringMaintenanceError extends TimeoutError {

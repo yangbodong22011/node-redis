@@ -60,9 +60,10 @@ export default class RedisSocket extends EventEmitter {
   readonly #initiator;
   readonly #connectTimeout;
   readonly #reconnectStrategy;
-  readonly #socketFactory;
+  #socketFactory;
   readonly #socketTimeout;
   readonly #clientId: string;
+  #options?: RedisSocketOptions;
 
   #maintenanceTimeout: number | undefined;
 
@@ -106,9 +107,31 @@ export default class RedisSocket extends EventEmitter {
     this.#initiator = initiator;
     this.#connectTimeout = options?.connectTimeout ?? 5000;
     this.#reconnectStrategy = this.#createReconnectStrategy(options);
+    this.#options = options;
     this.#socketFactory = this.#createSocketFactory(options);
     this.#socketTimeout = options?.socketTimeout;
     this.#clientId = clientId;
+  }
+
+  async reconnectTo(host: string, port: number): Promise<void> {
+    if (!this.#isOpen) {
+      throw new ClientClosedError();
+    }
+    if (this.#options && 'path' in this.#options) {
+      throw new Error('CAPA redirect is not supported with Unix sockets');
+    }
+
+    this.#options = {
+      ...this.#options,
+      host,
+      port
+    } as RedisSocketOptions;
+    this.#socketFactory = this.#createSocketFactory(this.#options);
+    this.#isReady = false;
+    this.#socket?.destroy();
+    this.#socket = undefined;
+
+    await this.#connect();
   }
 
   #createReconnectStrategy(options?: RedisSocketOptions): ReconnectStrategyFunction {
